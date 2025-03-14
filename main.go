@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -37,25 +38,26 @@ func validateArgs() (string, string, bool) {
 
 type fileMetadata struct {
 	size int64
+	path string // Full path to the file
 }
 
 func (fm fileMetadata) equals(other fileMetadata) bool {
 	return fm.size == other.size
+	// Note: path is intentionally ignored in equality check
 }
 
 func getFiles(path string) (map[string]fileMetadata, error) {
 	fileMap := make(map[string]fileMetadata)
 
-	// Get file info
 	fileInfo, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("error accessing path %s: %w", path, err)
 	}
 
-	// If it's a single file, just return its metadata
 	if !fileInfo.IsDir() {
 		if fileInfo.Mode().IsRegular() {
-			fileMap[path] = fileMetadata{size: fileInfo.Size()}
+			fileName := filepath.Base(path)
+			fileMap[fileName] = fileMetadata{size: fileInfo.Size(), path: path}
 		}
 		return fileMap, nil
 	}
@@ -68,20 +70,25 @@ func getFiles(path string) (map[string]fileMetadata, error) {
 
 	// Process each entry in the directory
 	for _, entry := range entries {
-		// Skip directories and non-regular files
 		if entry.IsDir() {
+			inner, err := getFiles(filepath.Join(path, entry.Name()))
+			if err != nil {
+				fmt.Printf("Warning: Could not get files for %s: %v\n", entry.Name(), err)
+				continue
+			}
+			for innerFileName, innerMetadata := range inner {
+				fileMap[innerFileName] = innerMetadata
+			}
 			continue
 		}
-
 		info, err := entry.Info()
 		if err != nil {
 			fmt.Printf("Warning: Could not get info for %s: %v\n", entry.Name(), err)
 			continue
 		}
 
-		// Only include regular files
 		if info.Mode().IsRegular() {
-			fileMap[entry.Name()] = fileMetadata{size: info.Size()}
+			fileMap[entry.Name()] = fileMetadata{size: info.Size(), path: filepath.Join(path, entry.Name())}
 		}
 	}
 
@@ -100,8 +107,8 @@ func findDuplicates(sourceFiles, destFiles map[string]fileMetadata) []duplicate 
 		if destMetadata, exists := destFiles[sourceName]; exists {
 			if sourceMetadata.equals(destMetadata) {
 				duplicates = append(duplicates, duplicate{
-					source:      sourceName,
-					destination: sourceName,
+					source:      sourceMetadata.path,
+					destination: destMetadata.path,
 				})
 			}
 		}
@@ -110,10 +117,9 @@ func findDuplicates(sourceFiles, destFiles map[string]fileMetadata) []duplicate 
 	return duplicates
 }
 
-func replaceWithSymlink(dup duplicate, sourcePath, destPath string) error {
-	sourceFilePath := fmt.Sprintf("%s/%s", sourcePath, dup.source)
-	destFilePath := fmt.Sprintf("%s/%s", destPath, dup.destination)
+func replaceWithSymlink(dup duplicate) error {
 	// Validate that both files exist before proceeding
+	sourceFilePath, destFilePath := dup.source, dup.destination
 	_, err := os.Stat(sourceFilePath)
 	if err != nil {
 		return fmt.Errorf("source file %s does not exist: %w", sourceFilePath, err)
@@ -137,16 +143,7 @@ func replaceWithSymlink(dup duplicate, sourcePath, destPath string) error {
 	return nil
 }
 
-func main() {
-	sourcePath, destPath, valid := validateArgs()
-	if !valid {
-		os.Exit(1)
-	}
-
-	fmt.Printf("Source path: %s\n", sourcePath)
-	fmt.Printf("Destination path: %s\n", destPath)
-
-	// Get metadata for source and destination files concurrently
+func getFilesParallel(sourcePath, destPath string) (map[string]fileMetadata, map[string]fileMetadata, error) {
 	var sourceFiles, destFiles map[string]fileMetadata
 	var sourceErr, destErr error
 
@@ -167,12 +164,47 @@ func main() {
 
 	// Check for errors
 	if sourceErr != nil {
-		fmt.Printf("Error: %v\n", sourceErr)
-		os.Exit(1)
+		return nil, nil, fmt.Errorf("error processing source path: %w", sourceErr)
 	}
 
 	if destErr != nil {
-		fmt.Printf("Error: %v\n", destErr)
+		return nil, nil, fmt.Errorf("error processing destination path: %w", destErr)
+	}
+
+	return sourceFiles, destFiles, nil
+}
+
+func replaceConcurrently(duplicates []duplicate) {
+	var wg sync.WaitGroup
+	wg.Add(len(duplicates))
+
+	for _, dup := range duplicates {
+		go func(dup duplicate) {
+			defer wg.Done()
+			err := replaceWithSymlink(dup)
+			if err != nil {
+				fmt.Printf("Error replacing with symlink: %v\n", err)
+			} else {
+				fmt.Printf("Replaced %s with symlink to %s\n", dup.destination, dup.source)
+			}
+		}(dup)
+	}
+
+	wg.Wait()
+}
+
+func main() {
+	sourcePath, destPath, valid := validateArgs()
+	if !valid {
+		os.Exit(1)
+	}
+
+	fmt.Printf("Source path: %s\n", sourcePath)
+	fmt.Printf("Destination path: %s\n", destPath)
+
+	sourceFiles, destFiles, err := getFilesParallel(sourcePath, destPath)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -183,13 +215,5 @@ func main() {
 	var duplicates = findDuplicates(sourceFiles, destFiles)
 	fmt.Printf("Found %d duplicates\n", len(duplicates))
 
-	// Example of how to use the new function (commented out for safety)
-	for _, dup := range duplicates {
-		err := replaceWithSymlink(dup, sourcePath, destPath)
-		if err != nil {
-			fmt.Printf("Error replacing with symlink: %v\n", err)
-		} else {
-			fmt.Printf("Replaced %s with symlink to %s\n", dup.destination, dup.source)
-		}
-	}
+	replaceConcurrently(duplicates)
 }
